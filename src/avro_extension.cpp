@@ -5,7 +5,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/multi_file_reader.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -45,11 +45,11 @@ struct AvroOptions {
 	}
 	static AvroOptions Deserialize(Deserializer &deserializer) {
 		AvroOptions options;
-		options.file_options = MultiFileReaderOptions::Deserialize(deserializer);
+		options.file_options = MultiFileOptions::Deserialize(deserializer);
 		return options;
 	}
 
-	MultiFileReaderOptions file_options;
+	MultiFileOptions file_options;
 };
 
 struct AvroReader;
@@ -437,7 +437,7 @@ struct AvroUnionData {
 	}
 };
 
-struct AvroReader {
+struct AvroReader : BaseFileReader {
 
 	using UNION_READER_DATA = unique_ptr<AvroUnionData>;
 
@@ -474,33 +474,37 @@ struct AvroReader {
 		output.SetCardinality(out_idx);
 	}
 
-	const string &GetFileName() {
-		return filename;
+	string GetReaderType() const override {
+		return "AVRO_SCAN";
 	}
 
-	const vector<MultiFileReaderColumnDefinition> &GetColumns() {
+	const OpenFileInfo &GetFileInfo() {
+		return file;
+	}
+
+	const vector<MultiFileColumnDefinition> &GetColumns() {
 		return columns;
 	}
 
-	AvroReader(ClientContext &context, const string filename_p, const AvroOptions &options_p) {
-		filename = filename_p;
+	AvroReader(ClientContext &context, const OpenFileInfo filename_p, const AvroOptions &options_p) : BaseFileReader(OpenFileInfo(filename_p)) {
 		options = options_p;
 		auto &fs = FileSystem::GetFileSystem(context);
-		if (!fs.FileExists(filename)) {
-			throw InvalidInputException("Avro file %s not found", filename);
+		if (!fs.FileExists(file.path)) {
+			throw InvalidInputException("Avro file %s not found", file.path);
 		}
 
-		auto file = fs.OpenFile(filename, FileOpenFlags::FILE_FLAGS_READ);
-		allocated_data = Allocator::Get(context).Allocate(file->GetFileSize());
+
+		auto open_file = fs.OpenFile(file, FileOpenFlags::FILE_FLAGS_READ);
+		allocated_data = Allocator::Get(context).Allocate(open_file->GetFileSize());
 		auto n_read = 0ll;
-		while (n_read < file->GetFileSize()) {
-			auto len = file->Read(allocated_data.get() + n_read, allocated_data.GetSize() - n_read);
+		while (n_read < open_file->GetFileSize()) {
+			auto len = open_file->Read(allocated_data.get() + n_read, allocated_data.GetSize() - n_read);
 			n_read += len;
 			if (len == 0) {
-				throw InvalidInputException("Could not read from file '%s'", filename);
+				throw InvalidInputException("Could not read from file '%s'", file.path);
 			}
 		}
-		D_ASSERT(n_read == file->GetFileSize());
+		D_ASSERT(n_read == open_file->GetFileSize());
 		auto avro_reader = avro_reader_memory(const_char_ptr_cast(allocated_data.get()), allocated_data.GetSize());
 
 		if (avro_reader_reader(avro_reader, &reader)) {
@@ -519,12 +523,12 @@ struct AvroReader {
 		// special handling for root structs, we pull up the entries
 		if (duckdb_type.id() == LogicalTypeId::STRUCT) {
 			for (idx_t child_idx = 0; child_idx < StructType::GetChildCount(duckdb_type); child_idx++) {
-				columns.push_back(MultiFileReaderColumnDefinition(StructType::GetChildName(duckdb_type, child_idx),
+				columns.push_back(MultiFileColumnDefinition(StructType::GetChildName(duckdb_type, child_idx),
 				                                                  StructType::GetChildType(duckdb_type, child_idx)));
 			}
 		} else {
 			auto schema_name = avro_schema_name(avro_schema);
-			columns.push_back(MultiFileReaderColumnDefinition(schema_name ? schema_name : "avro_schema", duckdb_type));
+			columns.push_back(MultiFileColumnDefinition(schema_name ? schema_name : "avro_schema", duckdb_type));
 		}
 		avro_schema_decref(avro_schema);
 	}
@@ -532,17 +536,16 @@ struct AvroReader {
 	avro_file_reader_t reader;
 	avro_value_t value;
 	unique_ptr<Vector> read_vec;
-
 	AllocatedData allocated_data;
 	AvroType avro_type;
 	LogicalType duckdb_type;
-	vector<MultiFileReaderColumnDefinition> columns;
-	AvroOptions options;
+	vector<MultiFileColumnDefinition> columns;
+
 	MultiFileReaderData reader_data;
-	string filename;
+	AvroOptions options;
 };
 
-struct AvroBindData : FunctionData {
+struct AvroBindData : MultiFileBindData {
 	shared_ptr<MultiFileList> file_list;
 	unique_ptr<MultiFileReader> multi_file_reader;
 	MultiFileReaderBindData reader_bind;
@@ -599,8 +602,9 @@ static unique_ptr<FunctionData> AvroBindFunction(ClientContext &context, TableFu
 	}
 	result->file_list = result->multi_file_reader->CreateFileList(context, filename);
 
+	MultiFileOptions multi_file_options = MultiFileOptions();
 	result->reader_bind = result->multi_file_reader->BindReader<AvroReader>(
-	    context, result->types, result->names, *result->file_list, *result, result->avro_options);
+	    context, result->types, result->names, *result->file_list, *result, result->avro_options, multi_file_options);
 
 	return_types = result->types;
 	names = result->names;
@@ -622,29 +626,28 @@ static bool AvroNextFile(ClientContext &context, const AvroBindData &bind_data, 
                          shared_ptr<AvroReader> initial_reader) {
 	unique_lock<mutex> parallel_lock(global_state.lock);
 
-	string file;
+	OpenFileInfo file;
 	if (!bind_data.file_list->Scan(global_state.scan_data, file)) {
 		return false;
 	}
 
 	// re-use initial reader for first file, no need to parse metadata again
 	if (initial_reader) {
-		D_ASSERT(file == initial_reader->filename);
+		D_ASSERT(file.path == initial_reader->file.path);
 		global_state.reader = initial_reader;
 	} else {
 		auto new_reader = make_shared_ptr<AvroReader>(context, file, bind_data.avro_options);
 		if (new_reader->duckdb_type != global_state.reader->duckdb_type) {
-			throw InvalidInputException("Schema of file %s (%s) differs from first file %s (%s)", new_reader->filename,
-			                            new_reader->duckdb_type.ToString(), global_state.reader->filename,
+			throw InvalidInputException("Schema of file %s (%s) differs from first file %s (%s)", new_reader->file.path,
+			                            new_reader->duckdb_type.ToString(), global_state.reader->file.path,
 			                            global_state.reader->duckdb_type.ToString());
 		}
 		global_state.reader = std::move(new_reader);
 	}
 
-	auto columns = MultiFileReaderColumnDefinition::ColumnsFromNamesAndTypes(bind_data.names, bind_data.types);
-	bind_data.multi_file_reader->InitializeReader(*global_state.reader, bind_data.avro_options.file_options,
-	                                              bind_data.reader_bind, columns, global_state.column_indexes,
-	                                              global_state.filters, file, context, nullptr);
+	auto columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(bind_data.names, bind_data.types);
+	bind_data.multi_file_reader->InitializeReader(*global_state.reader, bind_data, columns, global_state.column_indexes,
+	                                              global_state.filters, context, nullptr);
 	return true;
 }
 
@@ -654,8 +657,9 @@ static void AvroTableFunction(ClientContext &context, TableFunctionInput &data, 
 	do {
 		output.Reset();
 		global_state.reader->Read(output, global_state.column_indexes);
-		bind_data.multi_file_reader->FinalizeChunk(context, bind_data.reader_bind, global_state.reader->reader_data,
-		                                           output, nullptr);
+//		bind_data.multi_file_reader->FinalizeChunk(context, bind_data, data.reader, *data->reader_data,
+//			scan_chunk, output, data.executor,
+//			gstate.multi_file_reader_state);
 		if (output.size() > 0) {
 			return;
 		}
