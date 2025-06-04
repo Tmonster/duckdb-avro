@@ -124,6 +124,10 @@ AvroReader::AvroReader(ClientContext &context, OpenFileInfo file) : BaseFileRead
 	auto caching_file_handle = caching_file_system.OpenFile(this->file.path, FileOpenFlags::FILE_FLAGS_READ);
 	auto total_size = caching_file_handle->GetFileSize();
 	data_ptr_t data = nullptr;
+	auto whatever = 0;
+	if (whatever) {
+		Printer::Print("cool");
+	}
 
 	buf_handle = caching_file_handle->Read(data, total_size);
 	auto buffer_data = buf_handle.Ptr();
